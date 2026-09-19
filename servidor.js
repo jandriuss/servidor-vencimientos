@@ -39,7 +39,6 @@ const http = require('http');
 const crypto = require('crypto');
 const { initializeApp, cert } = require('firebase-admin/app');
 const { getFirestore } = require('firebase-admin/firestore');
-const nodemailer = require('nodemailer');
  
 /* La conexión con Firebase, por debajo, usa su propia conexión de red aparte
    de las peticiones normales del programa. Si esa conexión tiene un tropiezo
@@ -117,31 +116,25 @@ function segDesdeTexto(txt){
   catch(e){ return { usuarios: [], bitacora: [] }; }
 }
  
-/* El correo se manda con la cuenta personal de Gmail del administrador,
-   usando una "contraseña de aplicación" (no la contraseña real de esa
-   cuenta) guardada en las variables de entorno del servicio de hosting —
-   igual que FIREBASE_KEY, nunca en este archivo. Si esas dos variables no
-   están puestas, esta función de recuperación queda apagada sola: no
-   truena el servidor, simplemente no hay cómo avisarle a nadie por correo. */
-let transportadorCorreo = null;
-function puedeEnviarCorreo(){ return !!(process.env.GMAIL_USER && process.env.GMAIL_APP_PASS); }
-function transportador(){
-  if(!transportadorCorreo && puedeEnviarCorreo()){
-    transportadorCorreo = nodemailer.createTransport({
-      service: 'gmail',
-      auth: { user: process.env.GMAIL_USER, pass: process.env.GMAIL_APP_PASS }
-    });
-  }
-  return transportadorCorreo;
-}
+/* El correo se manda con Brevo (antes "Sendinblue"), un servicio gratuito
+   de envío de correo que funciona por internet normal (HTTPS), no por el
+   protocolo de correo tradicional (SMTP) — este servicio de hosting
+   gratuito bloquea el SMTP hacia afuera, así que Gmail directo nunca iba a
+   funcionar desde aquí. Hacen falta DOS variables de entorno del servicio
+   de hosting (igual que FIREBASE_KEY, nunca en este archivo):
+     BREVO_API_KEY    — la llave que genera Brevo para la cuenta
+     BREVO_FROM_EMAIL — el correo remitente, ya verificado en Brevo
+   Si esas dos variables no están puestas, esta función de recuperación
+   queda apagada sola: no truena el servidor, simplemente no hay cómo
+   avisarle a nadie por correo. */
+function puedeEnviarCorreo(){ return !!(process.env.BREVO_API_KEY && process.env.BREVO_FROM_EMAIL); }
 async function enviarClaveTemporalPorCorreo(nombre, correoDestino, claveNueva){
-  const t = transportador();
-  if(!t) return;
-  await t.sendMail({
-    from: 'Control de Vencimientos <'+process.env.GMAIL_USER+'>',
-    to: correoDestino,
+  if(!puedeEnviarCorreo()) return;
+  const cuerpo = {
+    sender: { email: process.env.BREVO_FROM_EMAIL, name: 'Control de Vencimientos' },
+    to: [ { email: correoDestino, name: nombre || '' } ],
     subject: 'Recuperación de acceso — Control de Vencimientos',
-    text:
+    textContent:
 `${nombre}:
  
 Alguien pidió recuperar el acceso de administrador en el programa de Control de Vencimientos, usando este correo.
@@ -151,7 +144,24 @@ Clave temporal (un solo uso): ${claveNueva}
 Entre al programa con esta clave; de inmediato le va a pedir que escriba una nueva, la que usted quiera.
  
 Si usted no pidió este cambio, entre de todas formas con esta clave y cámbiela usted mismo de una vez, para quedar protegido.`
-  });
+  };
+  try{
+    const resp = await fetch('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'api-key': process.env.BREVO_API_KEY
+      },
+      body: JSON.stringify(cuerpo)
+    });
+    if(!resp.ok){
+      const texto = await resp.text().catch(()=> '');
+      console.error('⚠️  Brevo respondió con error al enviar el correo de recuperación:', resp.status, texto);
+    }
+  }catch(e){
+    console.error('⚠️  No se pudo enviar el correo de recuperación (Brevo):', e.message);
+  }
 }
  
 /* Que no se pueda pedir la recuperación una y otra vez para el mismo
