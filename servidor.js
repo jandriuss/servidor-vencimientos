@@ -36,8 +36,10 @@
    se conserva igual. Ya no hay «todo o nada»: dos contadores trabajando
    en empresas distintas nunca chocan entre sí. */
 const http = require('http');
+const crypto = require('crypto');
 const { initializeApp, cert } = require('firebase-admin/app');
 const { getFirestore } = require('firebase-admin/firestore');
+const nodemailer = require('nodemailer');
  
 /* La conexión con Firebase, por debajo, usa su propia conexión de red aparte
    de las peticiones normales del programa. Si esa conexión tiene un tropiezo
@@ -78,6 +80,87 @@ function selloNuevo(){
 }
  
 function hoy(){ return new Date().toLocaleDateString('sv-SE'); }   // AAAA-MM-DD
+ 
+/* ---------- recuperación de contraseña del administrador ----------
+   El programa nunca guarda la contraseña como tal: guarda un derivado
+   PBKDF2 (SHA-256, 150.000 vueltas, sal propia) — eso ya lo hace el
+   navegador. Aquí se calcula EXACTAMENTE lo mismo, del lado del servidor,
+   para poder generarle una clave temporal al administrador y guardarla sin
+   que haga falta que nadie tenga una sesión abierta — que es justo lo que
+   hace falta cuando el que queda afuera es el propio administrador. */
+const ITER_CLAVE = 150000;
+ 
+function salNueva(){ return crypto.randomBytes(16).toString('hex'); }
+function derivarClave(clave, sal, iter){
+  return crypto.pbkdf2Sync(clave, Buffer.from(sal, 'utf8'), iter || ITER_CLAVE, 32, 'sha256').toString('hex');
+}
+function claveTemporal(){
+  const L='ABCDEFGHJKLMNPQRSTUVWXYZ', N='23456789', s='abcdefghijkmnpqrstuvwxyz';
+  const r=n=>n[Math.floor(Math.random()*n.length)];
+  return r(L)+r(s)+r(s)+r(s)+r(s)+'-'+r(N)+r(N)+r(N)+r(N);
+}
+/* El mismo sello de integridad que usa el programa en usuarios.seg — no es
+   seguridad, es solo para notar si alguien tocó el archivo a mano. */
+function sumaControl(texto){
+  let h=5381;
+  for(const ch of texto) h=((h*33)^ch.charCodeAt(0))>>>0;
+  return h.toString(16);
+}
+function segTextoDesde(usuarios, bitacora){
+  const cuerpo = JSON.stringify({v:1, app:'Control de Vencimientos', creado:new Date().toISOString(), usuarios, bitacora});
+  return 'CTRLVENCSEG1\n'+sumaControl(cuerpo)+'\n'+cuerpo;
+}
+function segDesdeTexto(txt){
+  if(!txt || txt.slice(0,12)!=='CTRLVENCSEG1') return { usuarios: [], bitacora: [] };
+  const l1 = txt.indexOf('\n'), l2 = txt.indexOf('\n', l1+1);
+  try{ const o = JSON.parse(txt.slice(l2+1)); return { usuarios: o.usuarios||[], bitacora: o.bitacora||[] }; }
+  catch(e){ return { usuarios: [], bitacora: [] }; }
+}
+ 
+/* El correo se manda con la cuenta personal de Gmail del administrador,
+   usando una "contraseña de aplicación" (no la contraseña real de esa
+   cuenta) guardada en las variables de entorno del servicio de hosting —
+   igual que FIREBASE_KEY, nunca en este archivo. Si esas dos variables no
+   están puestas, esta función de recuperación queda apagada sola: no
+   truena el servidor, simplemente no hay cómo avisarle a nadie por correo. */
+let transportadorCorreo = null;
+function puedeEnviarCorreo(){ return !!(process.env.GMAIL_USER && process.env.GMAIL_APP_PASS); }
+function transportador(){
+  if(!transportadorCorreo && puedeEnviarCorreo()){
+    transportadorCorreo = nodemailer.createTransport({
+      service: 'gmail',
+      auth: { user: process.env.GMAIL_USER, pass: process.env.GMAIL_APP_PASS }
+    });
+  }
+  return transportadorCorreo;
+}
+async function enviarClaveTemporalPorCorreo(nombre, correoDestino, claveNueva){
+  const t = transportador();
+  if(!t) return;
+  await t.sendMail({
+    from: 'Control de Vencimientos <'+process.env.GMAIL_USER+'>',
+    to: correoDestino,
+    subject: 'Recuperación de acceso — Control de Vencimientos',
+    text:
+`${nombre}:
+ 
+Alguien pidió recuperar el acceso de administrador en el programa de Control de Vencimientos, usando este correo.
+ 
+Clave temporal (un solo uso): ${claveNueva}
+ 
+Entre al programa con esta clave; de inmediato le va a pedir que escriba una nueva, la que usted quiera.
+ 
+Si usted no pidió este cambio, entre de todas formas con esta clave y cámbiela usted mismo de una vez, para quedar protegido.`
+  });
+}
+ 
+/* Que no se pueda pedir la recuperación una y otra vez para el mismo
+   correo en pocos minutos — ni falta le hace a un uso normal, y evita
+   gastar de más el envío de correos si alguien insiste sin necesidad.
+   Vive solo en memoria: se olvida si el servicio se reinicia, y no pasa
+   nada por eso. */
+const ultimaRecuperacion = new Map();   // correo (minúsculas) -> Date.now()
+const ESPERA_RECUPERAR = 5*60*1000;
  
 /* ---------- combinar (merge) registro por registro ----------
    base   = lo que el cliente tenía la ÚLTIMA VEZ que sincronizó con el servidor
@@ -300,6 +383,52 @@ const servidor = http.createServer(async (req, res) => {
       try{ await DOC_SEG.set({ contenido: cuerpo }); }
       catch(e){ console.error('⚠️  No se pudo guardar usuarios.seg:', e.message); }
       return responderJSON(res, 200, { ok: true });
+    }
+ 
+    /* Recuperar el acceso del administrador cuando olvidó su clave y no
+       tiene otro administrador ni una sesión abierta en otra parte. Es la
+       ÚNICA dirección de este servidor a la que se puede llegar sin haber
+       iniciado sesión en el programa — por eso nunca dice si el correo
+       coincidió o no, ni si hubo algún error puntual: siempre responde lo
+       mismo, para no darle pistas a un curioso sobre quién está registrado. */
+    if(req.url === '/api/recuperar' && req.method === 'POST'){
+      const cuerpo = await leerCuerpo(req);
+      let entrada;
+      try{ entrada = JSON.parse(cuerpo); }catch(e){ return responderJSON(res, 400, { error: 'JSON inválido' }); }
+      const RESPUESTA = { ok: true, mensaje: 'Si el correo coincide con un administrador registrado, en unos minutos le llega un mensaje con una clave temporal.' };
+      const correo = (entrada.correo||'').trim().toLowerCase();
+      if(!correo || !puedeEnviarCorreo()) return responderJSON(res, 200, RESPUESTA);
+ 
+      const ahora = Date.now();
+      const antes = ultimaRecuperacion.get(correo);
+      if(antes && (ahora-antes) < ESPERA_RECUPERAR) return responderJSON(res, 200, RESPUESTA);
+ 
+      try{
+        const estado = await leerEstado();
+        const contadores = (estado.datos && estado.datos.contadores) || [];
+        const jefe = contadores.find(c => c.rol==='jefe' && c.activo!==false && (c.correo||'').trim().toLowerCase()===correo);
+        if(!jefe) return responderJSON(res, 200, RESPUESTA);
+ 
+        ultimaRecuperacion.set(correo, ahora);
+ 
+        const snapSeg = await DOC_SEG.get();
+        const { usuarios, bitacora } = segDesdeTexto(snapSeg.exists ? (snapSeg.data().contenido||'') : '');
+ 
+        const claveNueva = claveTemporal();
+        const sal = salNueva();
+        let u = usuarios.find(x=>x.id===jefe.id);
+        if(!u){ u = { id: jefe.id }; usuarios.push(u); }
+        u.sal=sal; u.iter=ITER_CLAVE; u.hash=derivarClave(claveNueva, sal, ITER_CLAVE);
+        u.debeCambiar=true; u.cambiada=hoy(); u.intentos=0; u.bloqueado=false; u.esperaHasta=0;
+ 
+        bitacora.push({ t: new Date().toISOString(), u: jefe.id, n: jefe.nombre, s:'', a:'CLAVE TEMPORAL', d:'generada por recuperación de contraseña (correo)' });
+ 
+        await DOC_SEG.set({ contenido: segTextoDesde(usuarios, bitacora) });
+        await enviarClaveTemporalPorCorreo(jefe.nombre, jefe.correo, claveNueva);
+      }catch(e){
+        console.error('⚠️  Error en /api/recuperar:', e.message);
+      }
+      return responderJSON(res, 200, RESPUESTA);
     }
  
     if(req.url === '/api/latir' && req.method === 'POST'){
