@@ -96,14 +96,28 @@ function igual(a, b){
   return JSON.stringify(a===undefined?null:a) === JSON.stringify(b===undefined?null:b);
 }
  
-function mapaPorId(arr){
+/* La mayoría de las listas (empresas, sedes, obligaciones, vencimientos,
+   contadores) tienen un campo "id" propio de cada registro. Los
+   CALENDARIOS son la excepción: no tienen "id" — cada uno se identifica,
+   dentro del programa, por la combinación jurisdicción+impuesto+año+periodo
+   (así es como el propio programa evita duplicados al guardar). Por eso
+   hace falta esta excepción: si se los tratara igual que a los demás
+   (buscando un "id" que no tienen), TODOS los calendarios quedarían fuera
+   de la combinación y se borrarían en cada guardado. */
+function idDeRegistro(clave, r){
+  if(!r) return null;
+  if(clave === 'calendarios') return [r.jur, r.imp, r.anio, r.periodo].join('|');
+  return (r.id!=null) ? String(r.id) : null;
+}
+ 
+function mapaPorClave(clave, arr){
   const m = new Map();
-  (Array.isArray(arr)?arr:[]).forEach(r => { if(r && r.id!=null) m.set(r.id, r); });
+  (Array.isArray(arr)?arr:[]).forEach(r => { const id = idDeRegistro(clave, r); if(id!=null) m.set(id, r); });
   return m;
 }
  
-function combinarLista(base, mio, actual){
-  const mapB = mapaPorId(base), mapM = mapaPorId(mio), mapA = mapaPorId(actual);
+function combinarLista(clave, base, mio, actual){
+  const mapB = mapaPorClave(clave, base), mapM = mapaPorClave(clave, mio), mapA = mapaPorClave(clave, actual);
   const idsTotal = new Set([...mapM.keys(), ...mapA.keys()]);
   const salida = [];
   const conflictos = [];
@@ -142,7 +156,7 @@ function combinarDatos(base, mio, actual){
   const todasLasClaves = new Set([...Object.keys(mio), ...Object.keys(actual), ...Object.keys(base)]);
   todasLasClaves.forEach(clave => {
     if(CLAVES_POR_ID.includes(clave)){
-      const { lista, conflictos } = combinarLista(base[clave], mio[clave], actual[clave]);
+      const { lista, conflictos } = combinarLista(clave, base[clave], mio[clave], actual[clave]);
       resultado[clave] = lista;
       conflictos.forEach(c => conflictosPorTipo.push({ tipo: clave, id: c.id }));
     } else {
