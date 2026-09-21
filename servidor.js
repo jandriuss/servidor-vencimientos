@@ -1,5 +1,5 @@
 /* Servidor de Control de Vencimientos — versión "en la nube".
- 
+
    Es el mismo programa de siempre, con un solo cambio de fondo: en vez de
    guardar el dato en el disco de un computador de la oficina (que se borra
    cada vez que este servicio gratuito se duerme y despierta), lo guarda en
@@ -114,6 +114,19 @@ function segDesdeTexto(txt){
   const l1 = txt.indexOf('\n'), l2 = txt.indexOf('\n', l1+1);
   try{ const o = JSON.parse(txt.slice(l2+1)); return { usuarios: o.usuarios||[], bitacora: o.bitacora||[] }; }
   catch(e){ return { usuarios: [], bitacora: [] }; }
+}
+/* La bitácora es un registro que solo CRECE (cada quien le agrega renglones,
+   nadie edita uno que ya existe), así que combinarla es más simple que
+   combinarLista: no hace falta decidir quién "gana" — solo juntar todo lo
+   que cada lado tenga que el otro no tenga todavía, sin duplicar. Un
+   renglón no trae id propio, así que se identifica por sus propios campos. */
+function claveBitacora(e){ return [e.t, e.u, e.a, e.d, e.s].map(x=>x==null?'':String(x)).join('|'); }
+function combinarBitacora(mio, actual){
+  const vistos = new Set((actual||[]).map(claveBitacora));
+  const salida = (actual||[]).slice();
+  (mio||[]).forEach(e=>{ const k=claveBitacora(e); if(!vistos.has(k)){ salida.push(e); vistos.add(k); } });
+  salida.sort((a,b)=> (a.t||'') < (b.t||'') ? -1 : (a.t||'') > (b.t||'') ? 1 : 0);
+  return salida.length>3000 ? salida.slice(-3000) : salida;
 }
  
 /* El correo se manda con Brevo (antes "Sendinblue"), un servicio gratuito
@@ -388,11 +401,53 @@ const servidor = http.createServer(async (req, res) => {
         return res.end();
       }
     }
+    /* OJO — CAMBIO IMPORTANTE (sept/2026): antes esto era un "el que guarda
+       de último, gana": cualquier equipo que mandara CUALQUIER cambio
+       (literalmente cualquier «guardar», porque anotar() llama a
+       guardarSeg() casi en cada acción del programa) reemplazaba TODO el
+       archivo de credenciales con la copia que tuviera en memoria en ESE
+       momento — y esa copia se carga solo al entrar, nunca se refresca
+       mientras alguien sigue trabajando. Con varios contadores conectados
+       a la vez, el equipo con la copia más vieja terminaba pisando, tarde o
+       temprano, cualquier cambio que otro hubiera hecho mientras tanto:
+       desbloquear a alguien, generarle una clave temporal, lo que fuera.
+       Eso era exactamente el bug que reportó el usuario con la cuenta de
+       María Estefani: el administrador la desbloqueaba, y minutos después
+       cualquier otro contador con una sesión más vieja abierta hacía
+       cualquier guardado normal y sin querer la volvía a bloquear.
+       Ahora se combina registro por registro, igual que /api/estado: cada
+       usuario se identifica por su «id», y la bitácora se junta sin perder
+       renglones de ningún lado (ver combinarBitacora arriba). */
     if(req.url === '/api/seg' && req.method === 'POST'){
       const cuerpo = await leerCuerpo(req);
-      try{ await DOC_SEG.set({ contenido: cuerpo }); }
-      catch(e){ console.error('⚠️  No se pudo guardar usuarios.seg:', e.message); }
-      return responderJSON(res, 200, { ok: true });
+      let entrada;
+      try{ entrada = JSON.parse(cuerpo); }
+      catch(e){
+        /* Compatibilidad: una copia del programa todavía sin actualizar puede
+           seguir mandando el texto plano completo de siempre. Se guarda tal
+           cual para no dejarla sin servicio, aunque sin el mérito de la
+           combinación — por eso vale la pena avisar en el registro. */
+        console.error('⚠️  /api/seg recibió texto plano (copia del programa sin actualizar): se guardó sin combinar.');
+        try{ await DOC_SEG.set({ contenido: cuerpo }); }catch(e2){}
+        return responderJSON(res, 200, { ok: true, legacy: true });
+      }
+      try{
+        const resultado = await db.runTransaction(async (tx) => {
+          const snap = await tx.get(DOC_SEG);
+          const actual = segDesdeTexto(snap.exists ? (snap.data().contenido||'') : '');
+          const base = entrada.base || { usuarios: [], bitacora: [] };
+          const mio  = entrada.mio  || { usuarios: [], bitacora: [] };
+          const { lista: usuarios, conflictos } = combinarLista('usuariosSeg', base.usuarios, mio.usuarios, actual.usuarios);
+          const bitacora = combinarBitacora(mio.bitacora, actual.bitacora);
+          const texto = segTextoDesde(usuarios, bitacora);
+          tx.set(DOC_SEG, { contenido: texto });
+          return { texto, conflictos };
+        });
+        return responderJSON(res, 200, { ok: true, texto: resultado.texto, conflictos: resultado.conflictos });
+      }catch(e){
+        console.error('⚠️  No se pudo guardar usuarios.seg:', e.message);
+        return responderJSON(res, 500, { error: 'no se pudo guardar' });
+      }
     }
  
     /* Recuperar el acceso del administrador cuando olvidó su clave y no
@@ -421,19 +476,22 @@ const servidor = http.createServer(async (req, res) => {
  
         ultimaRecuperacion.set(correo, ahora);
  
-        const snapSeg = await DOC_SEG.get();
-        const { usuarios, bitacora } = segDesdeTexto(snapSeg.exists ? (snapSeg.data().contenido||'') : '');
- 
+        /* En una transacción, igual que /api/seg ahora: lee, modifica solo el
+           renglón del administrador, y escribe — así no pisa, por una
+           coincidencia de tiempos, un guardado normal que algún equipo
+           conectado esté haciendo en el mismo instante. */
         const claveNueva = claveTemporal();
         const sal = salNueva();
-        let u = usuarios.find(x=>x.id===jefe.id);
-        if(!u){ u = { id: jefe.id }; usuarios.push(u); }
-        u.sal=sal; u.iter=ITER_CLAVE; u.hash=derivarClave(claveNueva, sal, ITER_CLAVE);
-        u.debeCambiar=true; u.cambiada=hoy(); u.intentos=0; u.bloqueado=false; u.esperaHasta=0;
- 
-        bitacora.push({ t: new Date().toISOString(), u: jefe.id, n: jefe.nombre, s:'', a:'CLAVE TEMPORAL', d:'generada por recuperación de contraseña (correo)' });
- 
-        await DOC_SEG.set({ contenido: segTextoDesde(usuarios, bitacora) });
+        await db.runTransaction(async (tx) => {
+          const snapSeg = await tx.get(DOC_SEG);
+          const { usuarios, bitacora } = segDesdeTexto(snapSeg.exists ? (snapSeg.data().contenido||'') : '');
+          let u = usuarios.find(x=>x.id===jefe.id);
+          if(!u){ u = { id: jefe.id }; usuarios.push(u); }
+          u.sal=sal; u.iter=ITER_CLAVE; u.hash=derivarClave(claveNueva, sal, ITER_CLAVE);
+          u.debeCambiar=true; u.cambiada=hoy(); u.intentos=0; u.bloqueado=false; u.esperaHasta=0;
+          bitacora.push({ t: new Date().toISOString(), u: jefe.id, n: jefe.nombre, s:'', a:'CLAVE TEMPORAL', d:'generada por recuperación de contraseña (correo)' });
+          tx.set(DOC_SEG, { contenido: segTextoDesde(usuarios, bitacora) });
+        });
         await enviarClaveTemporalPorCorreo(jefe.nombre, jefe.correo, claveNueva);
       }catch(e){
         console.error('⚠️  Error en /api/recuperar:', e.message);
@@ -470,3 +528,4 @@ servidor.listen(PUERTO, () => {
   console.log(' Guardado por registro: contadores en empresas distintas ya no chocan entre sí.');
   console.log('========================================================');
 });
+ 
