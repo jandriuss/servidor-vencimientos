@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+    <!DOCTYPE html>
 <html lang="es">
 <head>
 <meta charset="utf-8">
@@ -5075,10 +5075,15 @@ async function quitarServidor(){
   await quitarHandle('servidor');
   renderConfig();
 }
-async function srvLeer(){
+/* liviano=true pide SOLO el sello, sin el archivo de datos completo — lo usa
+   el vigía (el sondeo automático cada 8 segundos), que solo necesita saber
+   si algo cambió en otro equipo; cuando sí cambió, trae el detalle aparte,
+   con srvEscribir(), una sola vez — no en cada sondeo. Esto es lo que más
+   ahorra de ancho de banda del servidor gratuito. */
+async function srvLeer(liviano){
   if(!SRV.ip || !TOKEN) return null;
   try{
-    const r=await fetch(srvUrl()+'/api/estado', {cache:'no-store', headers: cabecerasAuth()});
+    const r=await fetch(srvUrl()+'/api/estado'+(liviano?'?liviano=1':''), {cache:'no-store', headers: cabecerasAuth()});
     if(r.status===401){ sesionExpiro(); return null; }
     if(!r.ok) return null;
     return await r.json();
@@ -5293,7 +5298,7 @@ function arrancarVigia(){
     if(!SRV.ip || SRV.escribiendo) return;
     await latir(); await verGente();
     if(document.hidden) return;
-    const otro=await srvLeer();
+    const otro=await srvLeer(true);   // liviano: este sondeo solo necesita el sello, no el archivo completo
     if(!otro){ SRV.conectado=false; const el=document.getElementById('cfgSrvEstado');
       if(el) el.innerHTML='🔴 Sin conexión con '+U.esc(srvUrl())+' — revise que el servidor esté encendido.'; return; }
     SRV.conectado=true;
