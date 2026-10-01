@@ -58,11 +58,40 @@
      guardar sus propias empresas — o las que tenga asignadas puntualmente
      — nunca las de los demás; el servidor lo obliga aunque alguien
      modifique el programa que corre en su navegador.
+   ---------------------------------------------------------------------
+ 
+   ---------------------------------------------------------------------
+   CAMBIO: ahorro de ancho de banda (sept/2026)
+   ---------------------------------------------------------------------
+   El plan gratuito de este servicio de hosting incluye un tope mensual de
+   ancho de banda (los bytes que el servidor manda hacia afuera). Hasta
+   ahora este programa mandaba todas sus respuestas sin comprimir y sin
+   avisarle al navegador que podía reutilizar lo que ya tenía guardado, y
+   además el sondeo automático del programa (cada 8 segundos, mientras
+   alguien tenga la pantalla abierta) mandaba TODO el archivo de datos de
+   vuelta aunque nada hubiera cambiado. Con varios contadores conectados
+   toda la jornada, eso suma bastante. Tres cambios, ninguno de fondo:
+   · Todas las respuestas se comprimen (gzip) antes de mandarse, cuando el
+     navegador avisa que lo acepta (lo avisan todos los navegadores de
+     hoy en día) — el mismo contenido, muchos menos bytes por el cable.
+   · La aplicación (GET /) ahora lleva un "sello" (ETag): si el navegador
+     ya la tiene y nada cambió desde el último despliegue, el servidor
+     responde "sin cambios" (304) en vez de volver a mandar el archivo
+     completo (cerca de 370 KB) en cada entrada o recarga.
+   · El sondeo automático de cada 8 segundos ahora puede pedir SOLO el
+     sello de los datos (?liviano=1), sin el archivo completo — que es,
+     de hecho, lo único que esa parte puntual del programa necesitaba:
+     solo compara el sello para notar si algo cambió en otro equipo; si
+     cambió, trae el detalle aparte, con una sola petición, no con cada
+     sondeo. Esto es, de lejos, lo que más bytes ahorra.
+   Nada de esto cambia qué datos ve cada quien ni cómo se guardan — es
+   puramente una cuestión de cuántos bytes hacen falta para decir lo mismo.
    ---------------------------------------------------------------------ipsum*/
 const http = require('http');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const zlib = require('zlib');
 const { initializeApp, cert } = require('firebase-admin/app');
 const { getFirestore } = require('firebase-admin/firestore');
  
@@ -112,8 +141,10 @@ function hoy(){ return new Date().toLocaleDateString('sv-SE'); }   // AAAA-MM-DD
    del programa), hace falta un reinicio del servicio para que se note; eso
    ya pasa solo cada vez que se sube un cambio a GitHub/Render. */
 let HTML_APP = null;
+let ETAG_APP = null;   // "sello" del archivo actual — cambia solo si app.html cambia (o sea, en cada despliegue nuevo)
 try{
   HTML_APP = fs.readFileSync(path.join(__dirname, 'app.html'), 'utf8');
+  ETAG_APP = '"' + crypto.createHash('sha1').update(HTML_APP).digest('hex') + '"';
 }catch(e){
   console.error('⚠️  No se encontró app.html junto a servidor.js: por ahora GET / no puede servir la aplicación.', e.message);
 }
@@ -635,19 +666,51 @@ function leerCuerpo(req){
   });
 }
  
-function responderJSON(res, codigo, obj){
-  const txt = JSON.stringify(obj);
-  res.writeHead(codigo, {
+/* Comprime con gzip cuando vale la pena: solo si el navegador avisa que lo
+   acepta (cabecera "Accept-Encoding") y el cuerpo no es tan chiquito que
+   comprimir salga más caro que mandarlo tal cual. Si algo puntual falla al
+   comprimir (no debería, pero nunca hay que arriesgar una respuesta por
+   esto), se manda igual, sin comprimir. */
+function comprimirSiSePuede(req, buf){
+  const aceptaGzip = /\bgzip\b/i.test(req.headers['accept-encoding'] || '');
+  if(aceptaGzip && buf.length > 512){
+    try{ return { cuerpo: zlib.gzipSync(buf), comprimido: true }; }
+    catch(e){ console.error('⚠️  No se pudo comprimir una respuesta (se mandó sin comprimir):', e.message); }
+  }
+  return { cuerpo: buf, comprimido: false };
+}
+ 
+/* Punto único por el que sale cualquier respuesta con cuerpo (texto o
+   JSON): así la compresión queda resuelta en un solo lugar, no repetida en
+   cada dirección del servidor. */
+function enviarRespuesta(req, res, codigo, cabeceras, texto){
+  const buf = Buffer.from(texto, 'utf8');
+  const { cuerpo, comprimido } = comprimirSiSePuede(req, buf);
+  const cab = Object.assign({}, cabeceras);
+  if(comprimido) cab['Content-Encoding'] = 'gzip';
+  cab['Content-Length'] = cuerpo.length;
+  res.writeHead(codigo, cab);
+  res.end(cuerpo);
+}
+ 
+function responderJSON(req, res, codigo, obj){
+  enviarRespuesta(req, res, codigo, {
     'Content-Type': 'application/json; charset=utf-8',
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization'
-  });
-  res.end(txt);
+  }, JSON.stringify(obj));
 }
  
 const servidor = http.createServer(async (req, res) => {
   try{
+    /* La dirección puede traer parámetros (p.ej. /api/estado?liviano=1) —
+       se separa una sola vez aquí para que el resto del código compare
+       siempre contra la ruta sola, sin los parámetros. */
+    const partesUrl = req.url.split('?');
+    const pathname = partesUrl[0];
+    const query = new URLSearchParams(partesUrl[1] || '');
+ 
     if(req.method === 'OPTIONS'){
       res.writeHead(204, {
         'Access-Control-Allow-Origin': '*',
@@ -657,18 +720,28 @@ const servidor = http.createServer(async (req, res) => {
       return res.end();
     }
  
-    /* La aplicación misma, servida desde aquí — reemplaza el .html suelto. */
-    if(req.url === '/' && req.method === 'GET'){
+    /* La aplicación misma, servida desde aquí — reemplaza el .html suelto.
+       Lleva "sello" (ETag): si el navegador ya la tiene (manda el mismo
+       sello en If-None-Match), se responde 304 "sin cambios" sin volver a
+       mandar los ~370 KB del archivo. El sello cambia solo cuando cambia
+       app.html — o sea, en el próximo despliegue — así que nunca se sirve
+       una versión vieja por quedar en caché de más. */
+    if(pathname === '/' && req.method === 'GET'){
       if(HTML_APP){
-        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-        return res.end(HTML_APP);
+        if(ETAG_APP && req.headers['if-none-match'] === ETAG_APP){
+          res.writeHead(304, { 'ETag': ETAG_APP, 'Cache-Control': 'no-cache' });
+          return res.end();
+        }
+        const cab = { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' };
+        if(ETAG_APP) cab['ETag'] = ETAG_APP;
+        return enviarRespuesta(req, res, 200, cab, HTML_APP);
       }
       res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Access-Control-Allow-Origin': '*' });
       return res.end('Servidor de Control de Vencimientos — activo, pero falta el archivo app.html junto a servidor.js.\nRevise /salud para el estado del servidor.');
     }
  
     /* Estado del servidor (antes vivía en "/"). */
-    if(req.url === '/salud' && req.method === 'GET'){
+    if(pathname === '/salud' && req.method === 'GET'){
       const estado = await leerEstado();
       const n = (estado.datos && estado.datos.empresas) ? estado.datos.empresas.length : 0;
       res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Access-Control-Allow-Origin': '*' });
@@ -679,30 +752,30 @@ const servidor = http.createServer(async (req, res) => {
        información de negocio visible sin haber iniciado sesión, y solo
        hace falta para poder mostrar el desplegable de la pantalla de
        ingreso antes de entrar. */
-    if(req.url === '/api/quienes' && req.method === 'GET'){
+    if(pathname === '/api/quienes' && req.method === 'GET'){
       const estado = await leerEstado();
       const contadores = ((estado.datos && estado.datos.contadores) || [])
         .filter(c => c.activo !== false)
         .map(c => ({ id: c.id, nombre: c.nombre }));
-      return responderJSON(res, 200, { contadores });
+      return responderJSON(req, res, 200, { contadores });
     }
  
     /* Ingreso: aquí, y no en el navegador de cada quien, se decide si la
        clave es correcta. Responde siempre 200 (ok:true/false) — el "no
        encontrado"/"clave incorrecta" van en el cuerpo, no en el código de
        estado, para que el programa los muestre igual que siempre. */
-    if(req.url === '/api/entrar' && req.method === 'POST'){
+    if(pathname === '/api/entrar' && req.method === 'POST'){
       const cuerpo = await leerCuerpo(req);
       let entrada;
-      try{ entrada = JSON.parse(cuerpo); }catch(e){ return responderJSON(res, 400, { error: 'JSON inválido' }); }
+      try{ entrada = JSON.parse(cuerpo); }catch(e){ return responderJSON(req, res, 400, { error: 'JSON inválido' }); }
       const id = entrada.id, clave = entrada.clave;
-      if(!id || typeof clave !== 'string') return responderJSON(res, 400, { error: 'faltan datos' });
+      if(!id || typeof clave !== 'string') return responderJSON(req, res, 400, { error: 'faltan datos' });
       let r;
       try{ r = await intentarEntrar(id, clave); }
-      catch(e){ console.error('⚠️  Error en /api/entrar:', e.message); return responderJSON(res, 500, { error: 'no se pudo verificar' }); }
-      if(!r.ok) return responderJSON(res, 200, { ok:false, msg:r.msg });
+      catch(e){ console.error('⚠️  Error en /api/entrar:', e.message); return responderJSON(req, res, 500, { error: 'no se pudo verificar' }); }
+      if(!r.ok) return responderJSON(req, res, 200, { ok:false, msg:r.msg });
       const token = crearSesion(r.id, r.nombre, r.rol);
-      return responderJSON(res, 200, { ok:true, token, id:r.id, nombre:r.nombre, rol:r.rol, debeCambiar: !!r.debeCambiar });
+      return responderJSON(req, res, 200, { ok:true, token, id:r.id, nombre:r.nombre, rol:r.rol, debeCambiar: !!r.debeCambiar });
     }
  
     /* Cerrar sesión: el programa la llama al oprimir «Salir», para que el
@@ -710,26 +783,36 @@ const servidor = http.createServer(async (req, res) => {
        sola (hasta 24 horas). No hace falta que la llave sea válida para
        pedir esto — si ya venció o no existe, no hay nada que hacer, y
        responde igual de bien. */
-    if(req.url === '/api/salir' && req.method === 'POST'){
+    if(pathname === '/api/salir' && req.method === 'POST'){
       const token = tokenDe(req);
       if(token) SESIONES.delete(token);
-      return responderJSON(res, 200, { ok: true });
+      return responderJSON(req, res, 200, { ok: true });
     }
  
-    if(req.url === '/api/estado' && req.method === 'GET'){
+    if(pathname === '/api/estado' && req.method === 'GET'){
       const sesion = sesionDe(tokenDe(req));
-      if(!sesion) return responderJSON(res, 401, { error: 'sesión inválida o vencida' });
+      if(!sesion) return responderJSON(req, res, 401, { error: 'sesión inválida o vencida' });
       const estado = await leerEstado();
+      /* Sondeo liviano (?liviano=1): lo usa el "vigía" del programa, cada 8
+         segundos, mientras alguien tenga la pantalla abierta — y ESE sondeo
+         puntual solo necesita el sello, para notar si algo cambió en otro
+         equipo (si cambió, el programa trae el detalle aparte, una sola
+         vez). Antes se mandaba el archivo de datos completo en cada uno de
+         esos sondeos, así nada hubiera cambiado — era, de lejos, lo que más
+         ancho de banda gastaba. */
+      if(query.get('liviano') === '1'){
+        return responderJSON(req, res, 200, { sello: estado.sello });
+      }
       const datos = filtrarParaSesion(estado.datos || {}, sesion);
-      return responderJSON(res, 200, Object.assign({}, estado, { datos }));
+      return responderJSON(req, res, 200, Object.assign({}, estado, { datos }));
     }
  
-    if(req.url === '/api/estado' && req.method === 'POST'){
+    if(pathname === '/api/estado' && req.method === 'POST'){
       const sesion = sesionDe(tokenDe(req));
-      if(!sesion) return responderJSON(res, 401, { error: 'sesión inválida o vencida' });
+      if(!sesion) return responderJSON(req, res, 401, { error: 'sesión inválida o vencida' });
       const cuerpo = await leerCuerpo(req);
       let entrada;
-      try{ entrada = JSON.parse(cuerpo); }catch(e){ return responderJSON(res, 400, { error: 'JSON inválido' }); }
+      try{ entrada = JSON.parse(cuerpo); }catch(e){ return responderJSON(req, res, 400, { error: 'JSON inválido' }); }
  
       let resultado;
       try{
@@ -745,12 +828,12 @@ const servidor = http.createServer(async (req, res) => {
         });
       }catch(e){
         console.error('⚠️  Error guardando en Firestore:', e.message);
-        return responderJSON(res, 500, { error: 'no se pudo guardar' });
+        return responderJSON(req, res, 500, { error: 'no se pudo guardar' });
       }
  
       respaldoDelDiaSiHaceFalta(resultado._datos, resultado._equipo);  // de fondo, no bloquea la respuesta
       const datosParaCliente = filtrarParaSesion(resultado._datos, sesion);
-      return responderJSON(res, 200, { ok: true, sello: resultado.sello, datos: datosParaCliente, conflictos: resultado.conflictos });
+      return responderJSON(req, res, 200, { ok: true, sello: resultado.sello, datos: datosParaCliente, conflictos: resultado.conflictos });
     }
  
     /* Las credenciales viajan aparte de los datos (usuarios.seg), igual que
@@ -759,7 +842,7 @@ const servidor = http.createServer(async (req, res) => {
        nunca puede leer el archivo completo: la pantalla de Contadores, que
        es la única que lo necesita, ya está oculta para ese rol en el
        programa; el servidor ahora lo obliga también. */
-    if(req.url === '/api/seg' && req.method === 'GET'){
+    if(pathname === '/api/seg' && req.method === 'GET'){
       const sesion = sesionDe(tokenDe(req));
       if(!sesion){ res.writeHead(401, { 'Access-Control-Allow-Origin': '*' }); return res.end(); }
       if(sesion.rol === 'contador'){ res.writeHead(403, { 'Access-Control-Allow-Origin': '*' }); return res.end(); }
@@ -795,16 +878,16 @@ const servidor = http.createServer(async (req, res) => {
        solo puede tocar SU PROPIO registro (para cambiar su propia clave) y
        anotar en la bitácora renglones de SUS propias acciones — nunca los
        de otro usuario. jefe/consulta siguen con el guardado de siempre. */
-    if(req.url === '/api/seg' && req.method === 'POST'){
+    if(pathname === '/api/seg' && req.method === 'POST'){
       const sesion = sesionDe(tokenDe(req));
-      if(!sesion) return responderJSON(res, 401, { error: 'sesión inválida o vencida' });
+      if(!sesion) return responderJSON(req, res, 401, { error: 'sesión inválida o vencida' });
  
       const cuerpo = await leerCuerpo(req);
       let entrada;
       try{ entrada = JSON.parse(cuerpo); }
       catch(e){
         console.error('⚠️  /api/seg recibió texto plano (copia del programa sin actualizar): se rechazó por seguridad.');
-        return responderJSON(res, 400, { error: 'formato no admitido' });
+        return responderJSON(req, res, 400, { error: 'formato no admitido' });
       }
  
       if(sesion.rol === 'contador'){
@@ -828,10 +911,10 @@ const servidor = http.createServer(async (req, res) => {
             const snap = await DOC_SEG.get();
             texto = snap.exists ? (snap.data().contenido||'') : segTextoDesde([], []);
           }
-          return responderJSON(res, 200, { ok: true, texto });
+          return responderJSON(req, res, 200, { ok: true, texto });
         }catch(e){
           console.error('⚠️  No se pudo guardar usuarios.seg (contador):', e.message);
-          return responderJSON(res, 500, { error: 'no se pudo guardar' });
+          return responderJSON(req, res, 500, { error: 'no se pudo guardar' });
         }
       }
  
@@ -847,10 +930,10 @@ const servidor = http.createServer(async (req, res) => {
           tx.set(DOC_SEG, { contenido: texto });
           return { texto, conflictos };
         });
-        return responderJSON(res, 200, { ok: true, texto: resultado.texto, conflictos: resultado.conflictos });
+        return responderJSON(req, res, 200, { ok: true, texto: resultado.texto, conflictos: resultado.conflictos });
       }catch(e){
         console.error('⚠️  No se pudo guardar usuarios.seg:', e.message);
-        return responderJSON(res, 500, { error: 'no se pudo guardar' });
+        return responderJSON(req, res, 500, { error: 'no se pudo guardar' });
       }
     }
  
@@ -860,23 +943,23 @@ const servidor = http.createServer(async (req, res) => {
        iniciado sesión en el programa — por eso nunca dice si el correo
        coincidió o no, ni si hubo algún error puntual: siempre responde lo
        mismo, para no darle pistas a un curioso sobre quién está registrado. */
-    if(req.url === '/api/recuperar' && req.method === 'POST'){
+    if(pathname === '/api/recuperar' && req.method === 'POST'){
       const cuerpo = await leerCuerpo(req);
       let entrada;
-      try{ entrada = JSON.parse(cuerpo); }catch(e){ return responderJSON(res, 400, { error: 'JSON inválido' }); }
+      try{ entrada = JSON.parse(cuerpo); }catch(e){ return responderJSON(req, res, 400, { error: 'JSON inválido' }); }
       const RESPUESTA = { ok: true, mensaje: 'Si el correo coincide con un administrador registrado, en unos minutos le llega un mensaje con una clave temporal.' };
       const correo = (entrada.correo||'').trim().toLowerCase();
-      if(!correo || !puedeEnviarCorreo()) return responderJSON(res, 200, RESPUESTA);
+      if(!correo || !puedeEnviarCorreo()) return responderJSON(req, res, 200, RESPUESTA);
  
       const ahora = Date.now();
       const antes = ultimaRecuperacion.get(correo);
-      if(antes && (ahora-antes) < ESPERA_RECUPERAR) return responderJSON(res, 200, RESPUESTA);
+      if(antes && (ahora-antes) < ESPERA_RECUPERAR) return responderJSON(req, res, 200, RESPUESTA);
  
       try{
         const estado = await leerEstado();
         const contadores = (estado.datos && estado.datos.contadores) || [];
         const jefe = contadores.find(c => c.rol==='jefe' && c.activo!==false && (c.correo||'').trim().toLowerCase()===correo);
-        if(!jefe) return responderJSON(res, 200, RESPUESTA);
+        if(!jefe) return responderJSON(req, res, 200, RESPUESTA);
  
         ultimaRecuperacion.set(correo, ahora);
  
@@ -900,27 +983,27 @@ const servidor = http.createServer(async (req, res) => {
       }catch(e){
         console.error('⚠️  Error en /api/recuperar:', e.message);
       }
-      return responderJSON(res, 200, RESPUESTA);
+      return responderJSON(req, res, 200, RESPUESTA);
     }
  
-    if(req.url === '/api/latir' && req.method === 'POST'){
+    if(pathname === '/api/latir' && req.method === 'POST'){
       const cuerpo = await leerCuerpo(req);
       let entrada;
-      try{ entrada = JSON.parse(cuerpo); }catch(e){ return responderJSON(res, 400, { error: 'JSON inválido' }); }
+      try{ entrada = JSON.parse(cuerpo); }catch(e){ return responderJSON(req, res, 400, { error: 'JSON inválido' }); }
       if(entrada.id){
         conectados.set(entrada.id, { id: entrada.id, nombre: entrada.nombre||'', rol: entrada.rol||'', hora: Date.now() });
       }
-      return responderJSON(res, 200, { ok: true });
+      return responderJSON(req, res, 200, { ok: true });
     }
  
-    if(req.url === '/api/gente' && req.method === 'GET'){
-      return responderJSON(res, 200, { gente: gentaActiva() });
+    if(pathname === '/api/gente' && req.method === 'GET'){
+      return responderJSON(req, res, 200, { gente: gentaActiva() });
     }
  
-    responderJSON(res, 404, { error: 'no existe' });
+    responderJSON(req, res, 404, { error: 'no existe' });
   }catch(e){
     console.error('Error atendiendo una solicitud:', e);
-    try{ responderJSON(res, 500, { error: 'error interno del servidor' }); }catch(e2){}
+    try{ responderJSON(req, res, 500, { error: 'error interno del servidor' }); }catch(e2){}
   }
 });
  
@@ -954,4 +1037,3 @@ module.exports = {
   intentarEntrar, guardarUnUsuario,
   leerEstado, gentaActiva
 };
- 
